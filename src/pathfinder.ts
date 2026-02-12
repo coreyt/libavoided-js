@@ -1,4 +1,4 @@
-import type { Point, Segment } from './types.js';
+import type { Point, Segment, CardinalDirection } from './types.js';
 import type { Grid } from './grid.js';
 import { PriorityQueue } from './priority-queue.js';
 import { manhattanDistance, pointKey, parsePointKey, orthogonalSegmentsCross } from './geometry.js';
@@ -36,6 +36,8 @@ export interface PathfinderOptions {
   bendPenalty: number;
   crossingPenalty: number;
   lengthPenalty: number;
+  sourceDirection?: CardinalDirection;
+  targetDirection?: CardinalDirection;
 }
 
 /**
@@ -86,19 +88,26 @@ export function findPath(
   const gScore = new Map<string, number>();
   const cameFrom = new Map<string, { posKey: string; dir: Direction }>();
 
-  // Start with direction 'none'
-  const startState = stateKey(sourceKey, 'none');
+  // When sourceDirection is set, the start state uses that direction so only
+  // matching initial moves are expanded without a bend penalty.
+  const startDir: Direction = options.sourceDirection ?? 'none';
+  const startState = stateKey(sourceKey, startDir);
   gScore.set(startState, 0);
-  pq.push({ key: sourceKey, direction: 'none' }, manhattanDistance(source, target) * options.lengthPenalty);
+  pq.push({ key: sourceKey, direction: startDir }, manhattanDistance(source, target) * options.lengthPenalty);
 
   while (!pq.isEmpty()) {
     const current = pq.pop()!;
     const currentStateKey = stateKey(current.key, current.direction);
     const currentG = gScore.get(currentStateKey)!;
 
-    // Goal check
+    // Goal check — when targetDirection is set, only accept arrivals from the
+    // correct direction (the last segment must move in targetDirection).
     if (current.key === targetKey) {
-      return reconstructPath(cameFrom, current.key, current.direction, sourceKey);
+      if (!options.targetDirection || current.direction === options.targetDirection) {
+        return reconstructPath(cameFrom, current.key, current.direction, sourceKey);
+      }
+      // Wrong arrival direction — keep searching for a better path
+      continue;
     }
 
     const vertex = grid.vertices.get(current.key);
@@ -112,6 +121,12 @@ export function findPath(
 
       const neighborPoint = neighborVertex.point;
       const moveDir = getDirection(currentPoint, neighborPoint);
+
+      // Source direction constraint: from the source, only expand in the
+      // specified direction.
+      if (options.sourceDirection && current.key === sourceKey && moveDir !== options.sourceDirection) {
+        continue;
+      }
 
       // Calculate cost
       let cost = currentG + edgeDist * options.lengthPenalty;

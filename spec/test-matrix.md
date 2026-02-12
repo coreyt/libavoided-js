@@ -270,6 +270,96 @@ File: `tests/integration.test.ts`
 
 ---
 
+## 9. Property Tests — 63 tests
+
+File: `tests/property.test.ts`
+
+Tests behavioral invariants across 10 diverse fixtures. Each fixture runs `routeEdges` once in `beforeAll`, then checks 6 base invariants as separate `it` blocks. Fixtures with pinned edges or direction constraints add 1–2 additional tests.
+
+**Fixtures (10):**
+
+1. `no-obstacles-horizontal` — 0 obstacles, 1 horizontal edge
+2. `no-obstacles-vertical` — 0 obstacles, 1 vertical edge
+3. `no-obstacles-diagonal-endpoints` — 0 obstacles, 1 edge forcing L-shape
+4. `single-obstacle-in-path` — 1 obstacle, 1 edge routed around it
+5. `multiple-obstacles-corridor` — 3 obstacles, 1 edge through gaps
+6. `adjacent-obstacles-narrow-gap` — 2 obstacles ~25px apart, 1 edge through gap
+7. `multiple-edges-shared-source` — 1 obstacle, 3 edges with separate sources
+8. `pinned-edge-mixed` — 1 obstacle, 1 pinned + 1 regular edge
+9. `diamond-graph` — 4 obstacles, 4 edges
+10. `direction-constrained` — 2 obstacles, 2 edges with sourceDirection/targetDirection
+
+**Invariants checked per fixture:**
+
+| # | Invariant | Applied to |
+|---|-----------|------------|
+| 1 | Orthogonality (all segments axis-aligned) | All fixtures |
+| 2 | Obstacle avoidance (no path through interior) | All fixtures |
+| 3 | Endpoint preservation (startPoint = sourcePoint, endPoint = targetPoint) | All fixtures |
+| 4 | Edge count preservation (output count = input count) | All fixtures |
+| 5 | Edge ordering (output ids match input ids in order) | All fixtures |
+| 6 | Shape identity (incomingShape = sourceId, outgoingShape = targetId) | All fixtures |
+| 7 | Pinned waypoint fidelity | Fixture 8 only |
+| 8 | Direction constraint fidelity (first/last segment direction) | Fixture 10 only (2 tests) |
+
+**Test count:** 10 × 6 base + 1 pinned + 2 direction = **63 tests**
+
+---
+
+## 10. Performance Tests — 7 tests
+
+File: `tests/performance.test.ts`
+
+Uses a `generateGridLayout(rows, cols)` helper to build grid-of-nodes fixtures with edges between adjacent nodes. Each node is 40×30 with 60px spacing.
+
+| # | Scenario | Obstacles | Edges | Budget |
+|---|----------|-----------|-------|--------|
+| 90 | 3×3 grid | 9 | 12 | 50ms |
+| 91 | 5×5 grid | 25 | 40 | 200ms |
+| 92 | 8×8 grid | 64 | 112 | 500ms |
+| 93 | 10×10 grid | 100 | 180 | 1000ms |
+| 94 | 15×15 grid | 225 | 420 | 5000ms |
+| 95 | 50 edges, no obstacles | 0 | 50 | 100ms |
+| 96 | 50 obstacles, 1 edge | 50 | 1 | 100ms |
+
+---
+
+## 11. Determinism Tests — 11 tests
+
+File: `tests/determinism.test.ts`
+
+### N-run consistency (6 tests)
+
+Run `routeEdges` 5× on identical input, assert all outputs deep-equal.
+
+| # | Scenario | Pass Criteria |
+|---|----------|---------------|
+| 97 | Simple horizontal | 5 runs produce identical output. |
+| 98 | Single obstacle | 5 runs produce identical output. |
+| 99 | Diamond graph | 5 runs produce identical output. |
+| 100 | Multiple crossing edges | 5 runs produce identical output. |
+| 101 | Pinned edge | 5 runs produce identical output. |
+| 102 | Custom options | 5 runs produce identical output with non-default options. |
+
+### Incremental initial-run equivalence (3 tests)
+
+Assert `routeEdgesIncremental(input, null, null)` equals `routeEdges(input)`.
+
+| # | Scenario | Pass Criteria |
+|---|----------|---------------|
+| 103 | No obstacles | Incremental fallback equals full routing. |
+| 104 | With obstacles | Incremental fallback equals full routing. |
+| 105 | Diamond graph | Incremental fallback equals full routing. |
+
+### Cross-invocation deep equality (2 tests)
+
+| # | Scenario | Pass Criteria |
+|---|----------|---------------|
+| 106 | Structural deep-equal | Two invocations produce structurally equal (not reference-equal) output. |
+| 107 | JSON.stringify identity | `JSON.stringify` of two invocations produces identical strings. |
+
+---
+
 ## Summary
 
 | Category | File | Tests |
@@ -282,4 +372,7 @@ File: `tests/integration.test.ts`
 | Router pipeline | `tests/router.test.ts` | 9 |
 | Incremental routing | `tests/incremental.test.ts` | 6 |
 | Integration scenarios | `tests/integration.test.ts` | 10 |
-| **Total** | | **89** |
+| Property tests | `tests/property.test.ts` | 63 |
+| Performance tests | `tests/performance.test.ts` | 7 |
+| Determinism tests | `tests/determinism.test.ts` | 11 |
+| **Total** | | **170** |

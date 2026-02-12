@@ -35,6 +35,8 @@ Obstacles define axis-aligned bounding boxes. The router expands each obstacle b
 | `previousPath`     | `Point[]`                      | No       | Prior path used as a routing seed for incremental updates. |
 | `pinnedWaypoints`  | `Point[]`                      | No       | User-specified waypoints that must be used verbatim. |
 | `routingStyle`     | `'orthogonal' \| 'polyline'`   | No       | Per-edge routing style override (currently only `'orthogonal'` is implemented). |
+| `sourceDirection`  | `CardinalDirection`            | No       | Required direction for the first segment leaving the source (`'up'`, `'down'`, `'left'`, `'right'`). |
+| `targetDirection`  | `CardinalDirection`            | No       | Required direction for the last segment arriving at the target. |
 
 ### 1.4 `RouterOptions`
 
@@ -107,7 +109,7 @@ When an edge specifies `pinnedWaypoints`, the output `bendPoints` must equal the
 
 ### 3.5 Determinism
 
-Given identical input (same obstacles, edges, and options), the router must produce identical output. There is no internal randomness.
+Given identical input (same obstacles, edges, and options), the router must produce identical output. There is no internal randomness. Performance budgets are validated by the performance test suite to ensure routing completes within acceptable wall-clock time for typical graph sizes.
 
 ### 3.6 Incremental Stability
 
@@ -116,6 +118,20 @@ When `routeEdgesIncremental` is called with unchanged topology (same obstacles, 
 ### 3.7 Edge Ordering
 
 Output edges appear in the same order as input edges, preserving the caller's ordering.
+
+### 3.8 Shape Identity
+
+For each output edge, `incomingShape` equals the corresponding `EdgeRequest.sourceId` and `outgoingShape` equals `EdgeRequest.targetId`. This preserves the caller's node identity through the routing pipeline.
+
+### 3.9 Edge Count Preservation
+
+The number of edges in the output equals the number of edges in the input. Every input edge produces exactly one output edge.
+
+### 3.10 Direction Constraint Fidelity
+
+When `sourceDirection` is set on an edge, the first segment of the routed path must move in that cardinal direction from `sourcePoint`. When `targetDirection` is set, the last segment must arrive moving in that direction into `targetPoint` (e.g., `targetDirection: 'down'` means the final segment moves downward into the target).
+
+If the pathfinder cannot find a route satisfying the direction constraint, the direct-line fallback (§5.2) applies.
 
 ## 4. Default Option Values
 
@@ -155,4 +171,4 @@ The library exports two routing functions:
 - **`routeEdges(input, options?)`** — Full routing from scratch.
 - **`routeEdgesIncremental(input, previousInput, previousOutput, options?)`** — Incremental routing that reuses unchanged edges.
 
-And the following types: `Point`, `Obstacle`, `EdgeRequest`, `RouterOptions`, `RouterInput`, `RouterOutput`, `RoutedEdge`, `Rect`, `Segment`, `DEFAULT_OPTIONS`.
+And the following types: `Point`, `Obstacle`, `EdgeRequest`, `CardinalDirection`, `RouterOptions`, `RouterInput`, `RouterOutput`, `RoutedEdge`, `Rect`, `Segment`, `DEFAULT_OPTIONS`.

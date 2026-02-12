@@ -76,6 +76,8 @@ export function routeEdges(
         bendPenalty: opts.bendPenalty,
         crossingPenalty: opts.crossingPenalty,
         lengthPenalty: opts.lengthPenalty,
+        sourceDirection: edge.sourceDirection,
+        targetDirection: edge.targetDirection,
       },
       routedSegments,
     );
