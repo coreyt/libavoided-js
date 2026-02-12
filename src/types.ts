@@ -11,6 +11,8 @@ export interface Obstacle {
   height: number;
 }
 
+export type CardinalDirection = 'up' | 'down' | 'left' | 'right';
+
 export interface EdgeRequest {
   id: string;
   sourceId: string;
@@ -20,6 +22,8 @@ export interface EdgeRequest {
   previousPath?: Point[];
   pinnedWaypoints?: Point[];
   routingStyle?: 'orthogonal' | 'polyline';
+  sourceDirection?: CardinalDirection;
+  targetDirection?: CardinalDirection;
 }
 
 export interface RouterOptions {

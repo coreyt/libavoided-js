@@ -4,6 +4,7 @@ export type {
   Point,
   Obstacle,
   EdgeRequest,
+  CardinalDirection,
   RouterOptions,
   RouterInput,
   RouterOutput,
