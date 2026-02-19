@@ -11,6 +11,35 @@ export interface Grid {
   expandedObstacles: Rect[];
   /** Original (non-expanded) obstacles for anchor connection logic */
   rawObstacles: Obstacle[];
+  /** Index: x-coordinate → set of point keys at that x */
+  xIndex: Map<number, Set<string>>;
+  /** Index: y-coordinate → set of point keys at that y */
+  yIndex: Map<number, Set<string>>;
+}
+
+/**
+ * Normalize obstacles: filter zero/negative dimensions, deduplicate by id.
+ */
+export function normalizeObstacles(obstacles: Obstacle[]): Obstacle[] {
+  const seen = new Map<string, Obstacle>();
+  for (const o of obstacles) {
+    if (o.width <= 0 || o.height <= 0) continue;
+    seen.set(o.id, o);
+  }
+  return [...seen.values()];
+}
+
+function roundCoord(v: number): number {
+  return Math.round(v * 1e6) / 1e6;
+}
+
+function addToIndex(grid: Grid, point: Point, key: string): void {
+  const rx = roundCoord(point.x);
+  const ry = roundCoord(point.y);
+  if (!grid.xIndex.has(rx)) grid.xIndex.set(rx, new Set());
+  grid.xIndex.get(rx)!.add(key);
+  if (!grid.yIndex.has(ry)) grid.yIndex.set(ry, new Set());
+  grid.yIndex.get(ry)!.add(key);
 }
 
 /**
@@ -21,7 +50,8 @@ export function buildGrid(
   edges: EdgeRequest[],
   obstacleMargin: number,
 ): Grid {
-  const expandedObstacles = obstacles.map((o) => expandRect(o, obstacleMargin));
+  const normalized = normalizeObstacles(obstacles);
+  const expandedObstacles = normalized.map((o) => expandRect(o, obstacleMargin));
 
   // Collect anchor point keys (these are always allowed, even inside expanded obstacles)
   const anchorKeys = new Set<string>();
@@ -74,6 +104,10 @@ export function buildGrid(
   // Create vertices at intersections, excluding those inside obstacles
   // BUT always allowing anchor points
   const vertices = new Map<string, GridVertex>();
+  const xIndex = new Map<number, Set<string>>();
+  const yIndex = new Map<number, Set<string>>();
+  const grid: Grid = { vertices, expandedObstacles, rawObstacles: normalized, xIndex, yIndex };
+
   const finalX = [...xCoords].sort((a, b) => a - b);
   const finalY = [...yCoords].sort((a, b) => a - b);
 
@@ -84,6 +118,7 @@ export function buildGrid(
       const isAnchor = anchorKeys.has(key);
       if (!isAnchor && isInsideAnyObstacle(p, expandedObstacles)) continue;
       vertices.set(key, { point: p, neighbors: new Map() });
+      addToIndex(grid, p, key);
     }
   }
 
@@ -124,7 +159,7 @@ export function buildGrid(
     }
   }
 
-  return { vertices, expandedObstacles, rawObstacles: obstacles };
+  return grid;
 }
 
 function isInsideAnyObstacle(p: Point, obstacles: Rect[]): boolean {
@@ -141,8 +176,6 @@ function segmentPassesThroughObstacle(
 /**
  * Ensure a point exists in the grid by adding it and connecting to nearest
  * grid lines. Used to add edge anchors that may sit on obstacle borders.
- * For anchor points on obstacle borders, we connect through the margin zone
- * to reach the nearest grid vertex on the expanded obstacle boundary.
  */
 export function ensurePointInGrid(
   grid: Grid,
@@ -153,13 +186,10 @@ export function ensurePointInGrid(
   if (!grid.vertices.has(key)) {
     const vertex: GridVertex = { point, neighbors: new Map() };
     grid.vertices.set(key, vertex);
+    addToIndex(grid, point, key);
   }
 
   const vertex = grid.vertices.get(key)!;
-
-  // Always run connectAnchorToGrid for anchor points. A vertex may have
-  // gotten partial connections from another anchor's processing but still
-  // lack connections in other directions.
   connectAnchorToGrid(grid, key, point, vertex);
 }
 
@@ -169,39 +199,48 @@ function connectAnchorToGrid(
   point: Point,
   vertex: GridVertex,
 ): void {
-  // Collect candidates on same x-line and same y-line, sorted by distance
+  const rx = roundCoord(point.x);
+  const ry = roundCoord(point.y);
+
+  // Collect candidates on same x-line (vertical neighbors) using index
+  const sameXKeys = grid.xIndex.get(rx);
   const sameXVertices: Array<{ key: string; vertex: GridVertex; dist: number }> = [];
-  const sameYVertices: Array<{ key: string; vertex: GridVertex; dist: number }> = [];
-
-  for (const [nKey, nVertex] of grid.vertices) {
-    if (nKey === key) continue;
-    const np = nVertex.point;
-
-    if (Math.abs(np.x - point.x) < 1e-9) {
-      sameXVertices.push({ key: nKey, vertex: nVertex, dist: Math.abs(np.y - point.y) });
-    } else if (Math.abs(np.y - point.y) < 1e-9) {
-      sameYVertices.push({ key: nKey, vertex: nVertex, dist: Math.abs(np.x - point.x) });
+  if (sameXKeys) {
+    for (const nKey of sameXKeys) {
+      if (nKey === key) continue;
+      const nVertex = grid.vertices.get(nKey);
+      if (!nVertex) continue;
+      sameXVertices.push({ key: nKey, vertex: nVertex, dist: Math.abs(nVertex.point.y - point.y) });
     }
   }
 
-  // Sort by distance and connect to nearest on each side (up/down for x-line, left/right for y-line)
+  // Collect candidates on same y-line (horizontal neighbors) using index
+  const sameYKeys = grid.yIndex.get(ry);
+  const sameYVertices: Array<{ key: string; vertex: GridVertex; dist: number }> = [];
+  if (sameYKeys) {
+    for (const nKey of sameYKeys) {
+      if (nKey === key) continue;
+      const nVertex = grid.vertices.get(nKey);
+      if (!nVertex) continue;
+      sameYVertices.push({ key: nKey, vertex: nVertex, dist: Math.abs(nVertex.point.x - point.x) });
+    }
+  }
+
   sameXVertices.sort((a, b) => a.dist - b.dist);
   sameYVertices.sort((a, b) => a.dist - b.dist);
 
-  // Connect on x-line (vertical neighbors): find nearest above and below
   const above = sameXVertices.find((v) => v.vertex.point.y < point.y &&
-    !hasVertexBetween(grid, point, v.vertex.point, 'vertical') &&
+    !hasVertexBetweenIndexed(grid, point, v.vertex.point, 'vertical') &&
     !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
   const below = sameXVertices.find((v) => v.vertex.point.y > point.y &&
-    !hasVertexBetween(grid, point, v.vertex.point, 'vertical') &&
+    !hasVertexBetweenIndexed(grid, point, v.vertex.point, 'vertical') &&
     !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
 
-  // Connect on y-line (horizontal neighbors): find nearest left and right
   const left = sameYVertices.find((v) => v.vertex.point.x < point.x &&
-    !hasVertexBetween(grid, point, v.vertex.point, 'horizontal') &&
+    !hasVertexBetweenIndexed(grid, point, v.vertex.point, 'horizontal') &&
     !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
   const right = sameYVertices.find((v) => v.vertex.point.x > point.x &&
-    !hasVertexBetween(grid, point, v.vertex.point, 'horizontal') &&
+    !hasVertexBetweenIndexed(grid, point, v.vertex.point, 'horizontal') &&
     !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
 
   for (const neighbor of [above, below, left, right]) {
@@ -217,30 +256,68 @@ function segmentThroughRawObstacle(a: Point, b: Point, obstacles: Obstacle[]): b
   return obstacles.some((o) => segmentIntersectsRect(seg, o));
 }
 
-function hasVertexBetween(
+/**
+ * Check if there's a vertex between two points using coordinate indices.
+ */
+function hasVertexBetweenIndexed(
   grid: Grid,
   a: Point,
   b: Point,
   direction: 'horizontal' | 'vertical',
 ): boolean {
-  for (const [, v] of grid.vertices) {
-    const p = v.point;
-    if ((Math.abs(p.x - a.x) < 1e-9 && Math.abs(p.y - a.y) < 1e-9) ||
-        (Math.abs(p.x - b.x) < 1e-9 && Math.abs(p.y - b.y) < 1e-9)) continue;
+  if (direction === 'horizontal') {
+    const ry = roundCoord(a.y);
+    const keys = grid.yIndex.get(ry);
+    if (!keys) return false;
+    const minX = Math.min(a.x, b.x);
+    const maxX = Math.max(a.x, b.x);
+    for (const k of keys) {
+      const v = grid.vertices.get(k);
+      if (!v) continue;
+      if (v.point.x > minX + 1e-9 && v.point.x < maxX - 1e-9) return true;
+    }
+    return false;
+  } else {
+    const rx = roundCoord(a.x);
+    const keys = grid.xIndex.get(rx);
+    if (!keys) return false;
+    const minY = Math.min(a.y, b.y);
+    const maxY = Math.max(a.y, b.y);
+    for (const k of keys) {
+      const v = grid.vertices.get(k);
+      if (!v) continue;
+      if (v.point.y > minY + 1e-9 && v.point.y < maxY - 1e-9) return true;
+    }
+    return false;
+  }
+}
 
-    if (direction === 'horizontal') {
-      if (Math.abs(p.y - a.y) < 1e-9) {
-        const minX = Math.min(a.x, b.x);
-        const maxX = Math.max(a.x, b.x);
-        if (p.x > minX + 1e-9 && p.x < maxX - 1e-9) return true;
-      }
-    } else {
-      if (Math.abs(p.x - a.x) < 1e-9) {
-        const minY = Math.min(a.y, b.y);
-        const maxY = Math.max(a.y, b.y);
-        if (p.y > minY + 1e-9 && p.y < maxY - 1e-9) return true;
+/**
+ * Add extra scan lines around points to expand routing options.
+ * Used when initial pathfinding fails to find a route.
+ */
+export function expandGridAroundPoints(
+  grid: Grid,
+  points: Point[],
+  spread: number,
+): void {
+  const expandedObstacles = grid.expandedObstacles;
+
+  for (const p of points) {
+    const offsets = [-spread, 0, spread];
+    for (const dx of offsets) {
+      for (const dy of offsets) {
+        if (dx === 0 && dy === 0) continue;
+        const np: Point = { x: p.x + dx, y: p.y + dy };
+        const key = pointKey(np);
+        if (grid.vertices.has(key)) continue;
+        if (isInsideAnyObstacle(np, expandedObstacles)) continue;
+
+        const vertex: GridVertex = { point: np, neighbors: new Map() };
+        grid.vertices.set(key, vertex);
+        addToIndex(grid, np, key);
+        connectAnchorToGrid(grid, key, np, vertex);
       }
     }
   }
-  return false;
 }

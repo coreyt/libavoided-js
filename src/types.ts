@@ -13,6 +13,13 @@ export interface Obstacle {
 
 export type CardinalDirection = 'up' | 'down' | 'left' | 'right';
 
+export type PortSide = 'NORTH' | 'SOUTH' | 'EAST' | 'WEST';
+
+export interface PortSpec {
+  side: PortSide;
+  offset?: number;  // 0-1 position along the side (default: 0.5 = center)
+}
+
 export interface EdgeRequest {
   id: string;
   sourceId: string;
@@ -24,6 +31,8 @@ export interface EdgeRequest {
   routingStyle?: 'orthogonal' | 'polyline';
   sourceDirection?: CardinalDirection;
   targetDirection?: CardinalDirection;
+  sourcePort?: PortSpec;
+  targetPort?: PortSpec;
 }
 
 export interface RouterOptions {
@@ -33,6 +42,8 @@ export interface RouterOptions {
   bendPenalty?: number;
   crossingPenalty?: number;
   lengthPenalty?: number;
+  nudgeConnectedSegments?: boolean;
+  centerInChannels?: boolean;
 }
 
 export interface RouterInput {
@@ -40,19 +51,29 @@ export interface RouterInput {
   edges: EdgeRequest[];
 }
 
+export interface EdgeSection {
+  startPoint: Point;
+  endPoint: Point;
+  bendPoints: Point[];
+  incomingShape?: string;
+  outgoingShape?: string;
+  routed: boolean;
+}
+
 export interface RoutedEdge {
   id: string;
-  sections: Array<{
-    startPoint: Point;
-    endPoint: Point;
-    bendPoints: Point[];
-    incomingShape?: string;
-    outgoingShape?: string;
-  }>;
+  sections: EdgeSection[];
 }
 
 export interface RouterOutput {
   edges: RoutedEdge[];
+  _state?: RouterState;
+}
+
+export interface RouterState {
+  gridVertexCount: number;
+  obstacles: Obstacle[];
+  edgePathMap: Map<string, Point[]>;
 }
 
 export interface Rect {
@@ -74,4 +95,6 @@ export const DEFAULT_OPTIONS: Required<RouterOptions> = {
   bendPenalty: 50,
   crossingPenalty: 200,
   lengthPenalty: 1,
+  nudgeConnectedSegments: true,
+  centerInChannels: true,
 };
