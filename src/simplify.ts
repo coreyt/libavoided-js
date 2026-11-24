@@ -1,5 +1,12 @@
 import type { Point, Rect } from './types.js';
-import { areCollinear } from './geometry.js';
+import { areCollinear, segmentIntersectsRect } from './geometry.js';
+
+export interface SimplifyOptions {
+  /** Keep start and end points strictly fixed (L1). Default false for direct utility calls, true from routeEdges. */
+  preserveEndpoints?: boolean;
+  /** Raw obstacle bounds used to clamp parallel spacing & obstacle nudging without colliding (L2/L4). */
+  obstacles?: Rect[];
+}
 
 /**
  * Remove collinear middle points from an orthogonal path.
@@ -21,104 +28,145 @@ export function mergeCollinear(path: Point[]): Point[] {
 }
 
 /**
- * Space apart parallel edge segments that share the same line.
- * When multiple segments from different edges overlap on the same coordinate,
- * spread them by edgeSpacing. Maintains orthogonal consistency by adjusting
- * adjacent segments when a shared bend point is moved.
+ * Space apart parallel edge segments that overlap or sit closer than edgeSpacing.
+ * Maintains orthogonal consistency by adjusting adjacent segments when a shared
+ * bend point is moved, orders clusters planarly to minimize crossings (L4),
+ * preserves start/end port anchors when preserveEndpoints is set (L1), and avoids
+ * pushing rails into obstacles (L4).
  */
 export function spaceParallelSegments(
   paths: Point[][],
   edgeSpacing: number,
+  options?: SimplifyOptions,
 ): Point[][] {
   const result = paths.map((p) => p.map((pt) => ({ ...pt })));
+  const preserveEndpoints = options?.preserveEndpoints ?? false;
+  const obstacles = options?.obstacles ?? [];
+  const spacingTol = Math.max(1e-6, edgeSpacing - 1e-6);
 
-  // Collect all segments grouped by orientation + coordinate, but only from
-  // different edges (don't spread segments from the same edge)
   interface SegInfo {
     edgeIndex: number;
     segIndex: number;
+    orientation: 'horizontal' | 'vertical';
+    coord: number;
     min: number;
     max: number;
-  }
-  const groups = new Map<string, { orientation: 'horizontal' | 'vertical'; coordinate: number; segments: SegInfo[] }>();
-
-  for (let eIdx = 0; eIdx < result.length; eIdx++) {
-    const path = result[eIdx];
-    for (let sIdx = 0; sIdx < path.length - 1; sIdx++) {
-      const p1 = path[sIdx];
-      const p2 = path[sIdx + 1];
-
-      const isHoriz = Math.abs(p1.y - p2.y) < 1e-9;
-      const isVert = Math.abs(p1.x - p2.x) < 1e-9;
-      if (!isHoriz && !isVert) continue;
-
-      const orientation = isHoriz ? 'horizontal' as const : 'vertical' as const;
-      const coord = isHoriz ? p1.y : p1.x;
-      const key = `${orientation}:${coord}`;
-
-      if (!groups.has(key)) {
-        groups.set(key, { orientation, coordinate: coord, segments: [] });
-      }
-
-      const min = isHoriz ? Math.min(p1.x, p2.x) : Math.min(p1.y, p2.y);
-      const max = isHoriz ? Math.max(p1.x, p2.x) : Math.max(p1.y, p2.y);
-
-      groups.get(key)!.segments.push({ edgeIndex: eIdx, segIndex: sIdx, min, max });
-    }
+    /** Secondary-axis anchor hint from adjacent vertices for planar ordering (L4). */
+    planarOrderKey: number;
   }
 
-  for (const [, group] of groups) {
-    // Only spread segments from different edges that overlap
-    const byEdge = new Map<number, SegInfo[]>();
-    for (const seg of group.segments) {
-      if (!byEdge.has(seg.edgeIndex)) byEdge.set(seg.edgeIndex, []);
-      byEdge.get(seg.edgeIndex)!.push(seg);
+  for (const orientation of ['horizontal', 'vertical'] as const) {
+    const segs: SegInfo[] = [];
+    for (let eIdx = 0; eIdx < result.length; eIdx++) {
+      const path = result[eIdx];
+      for (let sIdx = 0; sIdx < path.length - 1; sIdx++) {
+        // L1: never detach startPoint or targetPoint when preserveEndpoints is enabled.
+        if (preserveEndpoints && (sIdx === 0 || sIdx + 1 === path.length - 1)) continue;
+        const p1 = path[sIdx];
+        const p2 = path[sIdx + 1];
+        const isHoriz = Math.abs(p1.y - p2.y) < 1e-9;
+        const isVert = Math.abs(p1.x - p2.x) < 1e-9;
+        if (orientation === 'horizontal' && !isHoriz) continue;
+        if (orientation === 'vertical' && !isVert) continue;
+
+        const coord = orientation === 'horizontal' ? p1.y : p1.x;
+        const min = orientation === 'horizontal' ? Math.min(p1.x, p2.x) : Math.min(p1.y, p2.y);
+        const max = orientation === 'horizontal' ? Math.max(p1.x, p2.x) : Math.max(p1.y, p2.y);
+        if (max - min <= 1e-9) continue;
+
+        // Planar ordering key: average perpendicular position of prev/next connected vertices.
+        const adj: number[] = [];
+        if (sIdx > 0) adj.push(orientation === 'horizontal' ? path[sIdx - 1].y : path[sIdx - 1].x);
+        if (sIdx + 2 < path.length) adj.push(orientation === 'horizontal' ? path[sIdx + 2].y : path[sIdx + 2].x);
+        const planarOrderKey = adj.length ? adj.reduce((a, b) => a + b, 0) / adj.length : coord;
+
+        segs.push({ edgeIndex: eIdx, segIndex: sIdx, orientation, coord, min, max, planarOrderKey });
+      }
     }
 
-    // Only consider clusters that contain segments from multiple edges
-    const multiEdgeSegs = group.segments.filter((seg) => {
-      // Check if any other edge has an overlapping segment
-      for (const other of group.segments) {
-        if (other.edgeIndex === seg.edgeIndex) continue;
-        if (other.min < seg.max - 1e-9 && other.max > seg.min + 1e-9) return true;
-      }
-      return false;
-    });
+    if (segs.length <= 1) continue;
 
-    if (multiEdgeSegs.length <= 1) continue;
-
-    // Group overlapping segments across edges
-    const clusters = findOverlappingClusters(multiEdgeSegs);
-
-    for (const cluster of clusters) {
-      if (cluster.length <= 1) continue;
-
-      // Deduplicate by edge (take first segment per edge in the cluster)
-      const edgeSet = new Map<number, SegInfo>();
-      for (const seg of cluster) {
-        if (!edgeSet.has(seg.edgeIndex)) {
-          edgeSet.set(seg.edgeIndex, seg);
+    // L4: cluster parallel segments from different edges that overlap longitudinally
+    // AND sit within < edgeSpacing perpendicularly (connected components).
+    const visited = new Uint8Array(segs.length);
+    for (let i = 0; i < segs.length; i++) {
+      if (visited[i]) continue;
+      const comp: SegInfo[] = [];
+      const queue = [i];
+      visited[i] = 1;
+      while (queue.length > 0) {
+        const curIdx = queue.pop()!;
+        const cur = segs[curIdx];
+        comp.push(cur);
+        for (let j = 0; j < segs.length; j++) {
+          if (visited[j]) continue;
+          const cand = segs[j];
+          if (cand.edgeIndex === cur.edgeIndex) continue;
+          if (Math.abs(cand.coord - cur.coord) < spacingTol
+            && cand.min < cur.max - 1e-9 && cand.max > cur.min + 1e-9) {
+            visited[j] = 1;
+            queue.push(j);
+          }
         }
       }
-      const uniqueByEdge = [...edgeSet.values()];
-      if (uniqueByEdge.length <= 1) continue;
 
-      const totalSpread = (uniqueByEdge.length - 1) * edgeSpacing;
-      const baseCoord = group.coordinate;
+      // Deduplicate by edge (first segment per edge in component).
+      const byEdge = new Map<number, SegInfo>();
+      for (const s of comp) {
+        if (!byEdge.has(s.edgeIndex)) byEdge.set(s.edgeIndex, s);
+      }
+      const unique = [...byEdge.values()];
+      if (unique.length <= 1) continue;
 
-      for (let i = 0; i < uniqueByEdge.length; i++) {
-        const offset = -totalSpread / 2 + i * edgeSpacing;
+      // Planar ordering (L4): sort by planarOrderKey, then original coord, then edgeIndex.
+      unique.sort((a, b) =>
+        (a.planarOrderKey - b.planarOrderKey)
+        || (a.coord - b.coord)
+        || (a.edgeIndex - b.edgeIndex));
+
+      const centerCoord = unique.reduce((sum, s) => sum + s.coord, 0) / unique.length;
+      const totalSpread = (unique.length - 1) * edgeSpacing;
+
+      for (let k = 0; k < unique.length; k++) {
+        const seg = unique[k];
+        const targetCoord = centerCoord - totalSpread / 2 + k * edgeSpacing;
+        const offset = targetCoord - seg.coord;
         if (Math.abs(offset) < 1e-9) continue;
 
-        const seg = uniqueByEdge[i];
         const path = result[seg.edgeIndex];
-
-        shiftSegment(path, seg.segIndex, group.orientation, offset);
+        // L4 obstacle check: verify shifted segment and adjacent connectors stay clear of obstacles.
+        if (obstacles.length > 0 && wouldHitObstacle(path, seg.segIndex, orientation, offset, obstacles)) {
+          continue;
+        }
+        shiftSegment(path, seg.segIndex, orientation, offset);
       }
     }
   }
 
   return result;
+}
+
+function wouldHitObstacle(
+  path: Point[],
+  segIndex: number,
+  orientation: 'horizontal' | 'vertical',
+  offset: number,
+  obstacles: Rect[],
+): boolean {
+  const p1 = { ...path[segIndex] };
+  const p2 = { ...path[segIndex + 1] };
+  if (orientation === 'horizontal') {
+    p1.y += offset;
+    p2.y += offset;
+  } else {
+    p1.x += offset;
+    p2.x += offset;
+  }
+  const shiftedSeg = { p1, p2 };
+  for (const obs of obstacles) {
+    if (segmentIntersectsRect(shiftedSeg, obs)) return true;
+  }
+  return false;
 }
 
 /**
@@ -152,30 +200,6 @@ function shiftSegment(
   }
 }
 
-function findOverlappingClusters(
-  segments: Array<{ edgeIndex: number; segIndex: number; min: number; max: number }>,
-): Array<typeof segments> {
-  const sorted = [...segments].sort((a, b) => a.min - b.min);
-  const clusters: Array<typeof segments> = [];
-
-  let current = [sorted[0]];
-  let currentMax = sorted[0].max;
-
-  for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i].min < currentMax - 1e-9) {
-      current.push(sorted[i]);
-      currentMax = Math.max(currentMax, sorted[i].max);
-    } else {
-      clusters.push(current);
-      current = [sorted[i]];
-      currentMax = sorted[i].max;
-    }
-  }
-  clusters.push(current);
-
-  return clusters;
-}
-
 /**
  * Push segments that are too close to obstacle boundaries away.
  * Only shifts entire segments along their perpendicular axis to maintain orthogonality.
@@ -190,24 +214,19 @@ export function nudgeAwayFromObstacles(
 }
 
 function nudgePath(path: Point[], obstacles: Rect[], margin: number): Point[] {
-  if (path.length <= 2) return [...path];
+  if (path.length <= 3) return [...path.map((p) => ({ ...p }))];
 
   const result = path.map((p) => ({ ...p }));
 
-  // Process interior segments only (segments where both endpoints are interior points)
-  // For segments touching start/end, only shift the interior endpoint
-  for (let i = 0; i < result.length - 1; i++) {
+  // L2: Only nudge strictly interior segments (both endpoints are interior bends)
+  // so endpoints stay anchored AND both ends move together, preserving orthogonality.
+  for (let i = 1; i < result.length - 2; i++) {
     const p1 = result[i];
     const p2 = result[i + 1];
 
     const isHoriz = Math.abs(p1.y - p2.y) < 1e-9;
     const isVert = Math.abs(p1.x - p2.x) < 1e-9;
     if (!isHoriz && !isVert) continue;
-
-    // Only nudge fully interior segments (neither endpoint is start or end of path)
-    const p1IsEndpoint = i === 0;
-    const p2IsEndpoint = i + 1 === result.length - 1;
-    if (p1IsEndpoint && p2IsEndpoint) continue; // 2-point path, skip
 
     for (const obs of obstacles) {
       if (isHoriz) {
@@ -216,19 +235,25 @@ function nudgePath(path: Point[], obstacles: Rect[], margin: number): Point[] {
         const segMaxX = Math.max(p1.x, p2.x);
         if (segMaxX <= obs.x || segMinX >= obs.x + obs.width) continue;
 
-        const distToTop = segY - obs.y;
-        const distToBottom = (obs.y + obs.height) - segY;
+        // L2 fixed distance sign: measure clearance outside top/bottom of obstacle.
+        const distOutsideTop = obs.y - segY;
+        const distOutsideBottom = segY - (obs.y + obs.height);
 
         let shift = 0;
-        if (distToTop > 0 && distToTop < margin) {
-          shift = -(margin - distToTop);
-        } else if (distToBottom > 0 && distToBottom < margin) {
-          shift = margin - distToBottom;
+        if (distOutsideTop >= 0 && distOutsideTop < margin) {
+          shift = -(margin - distOutsideTop);
+        } else if (distOutsideBottom >= 0 && distOutsideBottom < margin) {
+          shift = margin - distOutsideBottom;
+        } else if (segY > obs.y && segY < obs.y + obs.height) {
+          // Segment penetrated obstacle: push to nearer clear side.
+          const toTop = segY - obs.y + margin;
+          const toBottom = (obs.y + obs.height) - segY + margin;
+          shift = toTop <= toBottom ? -toTop : toBottom;
         }
 
-        if (Math.abs(shift) > 1e-9) {
-          if (!p1IsEndpoint) result[i].y += shift;
-          if (!p2IsEndpoint) result[i + 1].y += shift;
+        if (Math.abs(shift) > 1e-9 && !wouldHitObstacle(result, i, 'horizontal', shift, obstacles)) {
+          result[i].y += shift;
+          result[i + 1].y += shift;
         }
       } else {
         const segX = p1.x;
@@ -236,19 +261,23 @@ function nudgePath(path: Point[], obstacles: Rect[], margin: number): Point[] {
         const segMaxY = Math.max(p1.y, p2.y);
         if (segMaxY <= obs.y || segMinY >= obs.y + obs.height) continue;
 
-        const distToLeft = segX - obs.x;
-        const distToRight = (obs.x + obs.width) - segX;
+        const distOutsideLeft = obs.x - segX;
+        const distOutsideRight = segX - (obs.x + obs.width);
 
         let shift = 0;
-        if (distToLeft > 0 && distToLeft < margin) {
-          shift = -(margin - distToLeft);
-        } else if (distToRight > 0 && distToRight < margin) {
-          shift = margin - distToRight;
+        if (distOutsideLeft >= 0 && distOutsideLeft < margin) {
+          shift = -(margin - distOutsideLeft);
+        } else if (distOutsideRight >= 0 && distOutsideRight < margin) {
+          shift = margin - distOutsideRight;
+        } else if (segX > obs.x && segX < obs.x + obs.width) {
+          const toLeft = segX - obs.x + margin;
+          const toRight = (obs.x + obs.width) - segX + margin;
+          shift = toLeft <= toRight ? -toLeft : toRight;
         }
 
-        if (Math.abs(shift) > 1e-9) {
-          if (!p1IsEndpoint) result[i].x += shift;
-          if (!p2IsEndpoint) result[i + 1].x += shift;
+        if (Math.abs(shift) > 1e-9 && !wouldHitObstacle(result, i, 'vertical', shift, obstacles)) {
+          result[i].x += shift;
+          result[i + 1].x += shift;
         }
       }
     }
@@ -265,15 +294,19 @@ export function simplifyPaths(
   obstacles: Rect[],
   edgeSpacing: number,
   obstacleMargin: number,
+  options?: SimplifyOptions,
 ): Point[][] {
   // Step 1: Merge collinear points in each path
   let result = paths.map(mergeCollinear);
 
-  // Step 2: Space parallel segments
-  result = spaceParallelSegments(result, edgeSpacing);
+  // Step 2: Space parallel segments (preserving endpoints when requested, clamping to obstacles)
+  result = spaceParallelSegments(result, edgeSpacing, {
+    preserveEndpoints: options?.preserveEndpoints ?? false,
+    obstacles: options?.obstacles ?? obstacles,
+  });
 
-  // Step 3: Nudge away from obstacles
-  result = nudgeAwayFromObstacles(result, obstacles, obstacleMargin);
+  // Step 3: Nudge away from obstacles (strictly interior segments only, fixed distance signs)
+  result = nudgeAwayFromObstacles(result, options?.obstacles ?? obstacles, obstacleMargin);
 
   // Step 4: Final collinear merge (spacing/nudging may create new collinear runs)
   result = result.map(mergeCollinear);

@@ -1,7 +1,7 @@
 import type { Point, Segment, CardinalDirection } from './types.js';
 import type { Grid } from './grid.js';
 import { PriorityQueue } from './priority-queue.js';
-import { manhattanDistance, pointKey, parsePointKey, orthogonalSegmentsCross } from './geometry.js';
+import { manhattanDistance, pointKey, parsePointKey, orthogonalSegmentsCross, orthogonalCollinearOverlap } from './geometry.js';
 
 export type Direction = 'up' | 'down' | 'left' | 'right' | 'none';
 
@@ -36,12 +36,13 @@ export interface PathfinderOptions {
   bendPenalty: number;
   crossingPenalty: number;
   lengthPenalty: number;
+  sharedSegmentPenalty?: number;
   sourceDirection?: CardinalDirection;
   targetDirection?: CardinalDirection;
 }
 
 /**
- * Routed segments from previously routed edges, used for crossing detection.
+ * Routed segments from previously routed edges, used for crossing & collinear overlap detection.
  */
 export class RoutedSegments {
   private segments: Segment[] = [];
@@ -58,6 +59,15 @@ export class RoutedSegments {
       if (orthogonalSegmentsCross(seg, existing)) count++;
     }
     return count;
+  }
+
+  overlapLength(seg: Segment): number {
+    let total = 0;
+    for (const existing of this.segments) {
+      const ov = orthogonalCollinearOverlap(seg, existing);
+      if (ov > 0) total += ov;
+    }
+    return total;
   }
 }
 
@@ -136,11 +146,18 @@ export function findPath(
         cost += options.bendPenalty;
       }
 
-      // Crossing penalty
+      // Crossing and collinear shared-segment penalties (L3)
       if (routedSegments) {
         const seg: Segment = { p1: currentPoint, p2: neighborPoint };
         const crossings = routedSegments.countCrossings(seg);
         cost += crossings * options.crossingPenalty;
+        const sharedPenalty = options.sharedSegmentPenalty ?? 0;
+        if (sharedPenalty > 0) {
+          const ov = routedSegments.overlapLength(seg);
+          if (ov > 1e-6) {
+            cost += sharedPenalty + ov * options.lengthPenalty;
+          }
+        }
       }
 
       const neighborStateKey = stateKey(neighborKey, moveDir);

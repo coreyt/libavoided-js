@@ -11,6 +11,10 @@ export interface Grid {
   expandedObstacles: Rect[];
   /** Original (non-expanded) obstacles for anchor connection logic */
   rawObstacles: Obstacle[];
+  /** Sorted Y coordinates per X line for O(log N) anchor connection (L7). */
+  xLines?: Map<number, number[]>;
+  /** Sorted X coordinates per Y line for O(log N) anchor connection (L7). */
+  yLines?: Map<number, number[]>;
 }
 
 /**
@@ -42,12 +46,19 @@ export function buildGrid(
     yCoords.add(rect.y + rect.height);
   }
 
-  // From edge anchors
+  // From edge anchors and pinned waypoints (L5)
   for (const edge of edges) {
     xCoords.add(edge.sourcePoint.x);
     xCoords.add(edge.targetPoint.x);
     yCoords.add(edge.sourcePoint.y);
     yCoords.add(edge.targetPoint.y);
+
+    if (edge.pinnedWaypoints) {
+      for (const wp of edge.pinnedWaypoints) {
+        xCoords.add(wp.x);
+        yCoords.add(wp.y);
+      }
+    }
 
     // From previous path for incremental seeding
     if (edge.previousPath) {
@@ -58,17 +69,34 @@ export function buildGrid(
     }
   }
 
-  // Insert midpoint lines between adjacent obstacles for routing channels
+  // Exterior bounding frame so outer routes always have an unobstructed channel (L7)
+  if (xCoords.size > 0 && yCoords.size > 0) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const x of xCoords) { if (x < minX) minX = x; if (x > maxX) maxX = x; }
+    for (const y of yCoords) { if (y < minY) minY = y; if (y > maxY) maxY = y; }
+    const pad = Math.max(16, obstacleMargin * 2);
+    xCoords.add(minX - pad);
+    xCoords.add(maxX + pad);
+    yCoords.add(minY - pad);
+    yCoords.add(maxY + pad);
+  }
+
+  // Insert midpoint lines between adjacent coordinates that have enough room for a channel (L7).
+  // For large dense graphs, only bisect wider gaps so grid size stays O(N) instead of blowing up.
   const sortedX = [...xCoords].sort((a, b) => a - b);
   const sortedY = [...yCoords].sort((a, b) => a - b);
+  const minMidGapX = sortedX.length > 40 ? Math.max(16, obstacleMargin * 1.5) : 4;
+  const minMidGapY = sortedY.length > 40 ? Math.max(16, obstacleMargin * 1.5) : 4;
 
   for (let i = 0; i < sortedX.length - 1; i++) {
-    const mid = (sortedX[i] + sortedX[i + 1]) / 2;
-    xCoords.add(mid);
+    if (sortedX[i + 1] - sortedX[i] >= minMidGapX) {
+      xCoords.add((sortedX[i] + sortedX[i + 1]) / 2);
+    }
   }
   for (let i = 0; i < sortedY.length - 1; i++) {
-    const mid = (sortedY[i] + sortedY[i + 1]) / 2;
-    yCoords.add(mid);
+    if (sortedY[i + 1] - sortedY[i] >= minMidGapY) {
+      yCoords.add((sortedY[i] + sortedY[i + 1]) / 2);
+    }
   }
 
   // Create vertices at intersections, excluding those inside obstacles
@@ -76,21 +104,27 @@ export function buildGrid(
   const vertices = new Map<string, GridVertex>();
   const finalX = [...xCoords].sort((a, b) => a - b);
   const finalY = [...yCoords].sort((a, b) => a - b);
+  const xLines = new Map<number, number[]>();
+  const yLines = new Map<number, number[]>();
 
   for (const x of finalX) {
+    const ys: number[] = [];
     for (const y of finalY) {
       const p: Point = { x, y };
       const key = pointKey(p);
       const isAnchor = anchorKeys.has(key);
       if (!isAnchor && isInsideAnyObstacle(p, expandedObstacles)) continue;
       vertices.set(key, { point: p, neighbors: new Map() });
+      ys.push(y);
+      let xs = yLines.get(y);
+      if (!xs) { xs = []; yLines.set(y, xs); }
+      xs.push(x);
     }
+    if (ys.length > 0) xLines.set(x, ys);
   }
 
-  // Connect adjacent vertices along scan lines
-  // Horizontal connections (same y, adjacent x)
-  for (const y of finalY) {
-    const xsAtY = finalX.filter((x) => vertices.has(pointKey({ x, y })));
+  // Connect adjacent vertices along scan lines using indexed lines (L7)
+  for (const [y, xsAtY] of yLines) {
     for (let i = 0; i < xsAtY.length - 1; i++) {
       const p1 = { x: xsAtY[i], y };
       const p2 = { x: xsAtY[i + 1], y };
@@ -106,9 +140,7 @@ export function buildGrid(
     }
   }
 
-  // Vertical connections (same x, adjacent y)
-  for (const x of finalX) {
-    const ysAtX = finalY.filter((y) => vertices.has(pointKey({ x, y })));
+  for (const [x, ysAtX] of xLines) {
     for (let i = 0; i < ysAtX.length - 1; i++) {
       const p1 = { x, y: ysAtX[i] };
       const p2 = { x, y: ysAtX[i + 1] };
@@ -124,7 +156,7 @@ export function buildGrid(
     }
   }
 
-  return { vertices, expandedObstacles, rawObstacles: obstacles };
+  return { vertices, expandedObstacles, rawObstacles: obstacles, xLines, yLines };
 }
 
 function isInsideAnyObstacle(p: Point, obstacles: Rect[]): boolean {
@@ -144,9 +176,22 @@ function segmentPassesThroughObstacle(
  * For anchor points on obstacle borders, we connect through the margin zone
  * to reach the nearest grid vertex on the expanded obstacle boundary.
  */
+function insertSortedUnique(arr: number[], value: number): number {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < value - 1e-9) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo < arr.length && Math.abs(arr[lo] - value) < 1e-9) return lo;
+  arr.splice(lo, 0, value);
+  return lo;
+}
+
 export function ensurePointInGrid(
   grid: Grid,
   point: Point,
+  exemptObstacleIds?: ReadonlySet<string>,
 ): void {
   const key = pointKey(point);
 
@@ -155,12 +200,23 @@ export function ensurePointInGrid(
     grid.vertices.set(key, vertex);
   }
 
+  if (grid.xLines) {
+    let ys = grid.xLines.get(point.x);
+    if (!ys) { ys = []; grid.xLines.set(point.x, ys); }
+    insertSortedUnique(ys, point.y);
+  }
+  if (grid.yLines) {
+    let xs = grid.yLines.get(point.y);
+    if (!xs) { xs = []; grid.yLines.set(point.y, xs); }
+    insertSortedUnique(xs, point.x);
+  }
+
   const vertex = grid.vertices.get(key)!;
 
   // Always run connectAnchorToGrid for anchor points. A vertex may have
   // gotten partial connections from another anchor's processing but still
   // lack connections in other directions.
-  connectAnchorToGrid(grid, key, point, vertex);
+  connectAnchorToGrid(grid, key, point, vertex, exemptObstacleIds);
 }
 
 function connectAnchorToGrid(
@@ -168,8 +224,70 @@ function connectAnchorToGrid(
   key: string,
   point: Point,
   vertex: GridVertex,
+  exemptObstacleIds?: ReadonlySet<string>,
 ): void {
-  // Collect candidates on same x-line and same y-line, sorted by distance
+  // L6: Only exempt own sourceId/targetId obstacles when the anchor sits strictly INSIDE
+  // that obstacle (e.g. inset stencil/concave port), and only on the nearest exit side
+  // so a border anchor can never tunnel backwards through its own shape.
+  const rawObs = exemptObstacleIds && exemptObstacleIds.size > 0
+    ? grid.rawObstacles.filter((o) => !(exemptObstacleIds.has(o.id) && pointInRect(point, o)))
+    : grid.rawObstacles;
+
+  // Fast O(log N) path using indexed scan lines (L7)
+  if (grid.xLines && grid.yLines) {
+    const ys = grid.xLines.get(point.x);
+    if (ys) {
+      const idx = insertSortedUnique(ys, point.y);
+      if (idx > 0) {
+        const np = { x: point.x, y: ys[idx - 1] };
+        const nKey = pointKey(np);
+        const nVertex = grid.vertices.get(nKey);
+        if (nVertex && !segmentThroughRawObstacle(point, np, rawObs)) {
+          const dist = Math.abs(point.y - np.y);
+          vertex.neighbors.set(nKey, dist);
+          nVertex.neighbors.set(key, dist);
+        }
+      }
+      if (idx + 1 < ys.length) {
+        const np = { x: point.x, y: ys[idx + 1] };
+        const nKey = pointKey(np);
+        const nVertex = grid.vertices.get(nKey);
+        if (nVertex && !segmentThroughRawObstacle(point, np, rawObs)) {
+          const dist = Math.abs(np.y - point.y);
+          vertex.neighbors.set(nKey, dist);
+          nVertex.neighbors.set(key, dist);
+        }
+      }
+    }
+
+    const xs = grid.yLines.get(point.y);
+    if (xs) {
+      const idx = insertSortedUnique(xs, point.x);
+      if (idx > 0) {
+        const np = { x: xs[idx - 1], y: point.y };
+        const nKey = pointKey(np);
+        const nVertex = grid.vertices.get(nKey);
+        if (nVertex && !segmentThroughRawObstacle(point, np, rawObs)) {
+          const dist = Math.abs(point.x - np.x);
+          vertex.neighbors.set(nKey, dist);
+          nVertex.neighbors.set(key, dist);
+        }
+      }
+      if (idx + 1 < xs.length) {
+        const np = { x: xs[idx + 1], y: point.y };
+        const nKey = pointKey(np);
+        const nVertex = grid.vertices.get(nKey);
+        if (nVertex && !segmentThroughRawObstacle(point, np, rawObs)) {
+          const dist = Math.abs(np.x - point.x);
+          vertex.neighbors.set(nKey, dist);
+          nVertex.neighbors.set(key, dist);
+        }
+      }
+    }
+    return;
+  }
+
+  // Fallback for manually constructed Grids without scan-line indices
   const sameXVertices: Array<{ key: string; vertex: GridVertex; dist: number }> = [];
   const sameYVertices: Array<{ key: string; vertex: GridVertex; dist: number }> = [];
 
@@ -184,25 +302,22 @@ function connectAnchorToGrid(
     }
   }
 
-  // Sort by distance and connect to nearest on each side (up/down for x-line, left/right for y-line)
   sameXVertices.sort((a, b) => a.dist - b.dist);
   sameYVertices.sort((a, b) => a.dist - b.dist);
 
-  // Connect on x-line (vertical neighbors): find nearest above and below
   const above = sameXVertices.find((v) => v.vertex.point.y < point.y &&
     !hasVertexBetween(grid, point, v.vertex.point, 'vertical') &&
-    !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
+    !segmentThroughRawObstacle(point, v.vertex.point, rawObs));
   const below = sameXVertices.find((v) => v.vertex.point.y > point.y &&
     !hasVertexBetween(grid, point, v.vertex.point, 'vertical') &&
-    !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
+    !segmentThroughRawObstacle(point, v.vertex.point, rawObs));
 
-  // Connect on y-line (horizontal neighbors): find nearest left and right
   const left = sameYVertices.find((v) => v.vertex.point.x < point.x &&
     !hasVertexBetween(grid, point, v.vertex.point, 'horizontal') &&
-    !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
+    !segmentThroughRawObstacle(point, v.vertex.point, rawObs));
   const right = sameYVertices.find((v) => v.vertex.point.x > point.x &&
     !hasVertexBetween(grid, point, v.vertex.point, 'horizontal') &&
-    !segmentThroughRawObstacle(point, v.vertex.point, grid.rawObstacles));
+    !segmentThroughRawObstacle(point, v.vertex.point, rawObs));
 
   for (const neighbor of [above, below, left, right]) {
     if (neighbor) {

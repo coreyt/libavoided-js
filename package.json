@@ -1,6 +1,6 @@
 {
   "name": "libavoided-js",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Deterministic orthogonal edge router with obstacle avoidance",
   "type": "module",
   "main": "./dist/index.cjs",

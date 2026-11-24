@@ -142,6 +142,31 @@ export function parsePointKey(key: string): Point {
 }
 
 /**
+ * Return the positive overlap length if two orthogonal segments are collinear
+ * (both horizontal with matching y, or both vertical with matching x) and
+ * share a non-degenerate span. Returns 0 otherwise.
+ */
+export function orthogonalCollinearOverlap(a: Segment, b: Segment, tolerance = 1e-6): number {
+  const aHoriz = Math.abs(a.p1.y - a.p2.y) <= tolerance;
+  const bHoriz = Math.abs(b.p1.y - b.p2.y) <= tolerance;
+  if (aHoriz && bHoriz) {
+    if (Math.abs(a.p1.y - b.p1.y) > tolerance) return 0;
+    const minA = Math.min(a.p1.x, a.p2.x), maxA = Math.max(a.p1.x, a.p2.x);
+    const minB = Math.min(b.p1.x, b.p2.x), maxB = Math.max(b.p1.x, b.p2.x);
+    return Math.max(0, Math.min(maxA, maxB) - Math.max(minA, minB));
+  }
+  const aVert = Math.abs(a.p1.x - a.p2.x) <= tolerance;
+  const bVert = Math.abs(b.p1.x - b.p2.x) <= tolerance;
+  if (aVert && bVert) {
+    if (Math.abs(a.p1.x - b.p1.x) > tolerance) return 0;
+    const minA = Math.min(a.p1.y, a.p2.y), maxA = Math.max(a.p1.y, a.p2.y);
+    const minB = Math.min(b.p1.y, b.p2.y), maxB = Math.max(b.p1.y, b.p2.y);
+    return Math.max(0, Math.min(maxA, maxB) - Math.max(minA, minB));
+  }
+  return 0;
+}
+
+/**
  * Check if three points are collinear (all share same x or same y for orthogonal paths).
  */
 export function areCollinear(a: Point, b: Point, c: Point): boolean {

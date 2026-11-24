@@ -10,7 +10,7 @@ import { DEFAULT_OPTIONS as DEFAULTS } from './types.js';
 import { buildGrid, ensurePointInGrid } from './grid.js';
 import { findPath, RoutedSegments } from './pathfinder.js';
 import { simplifyPaths } from './simplify.js';
-import { manhattanDistance } from './geometry.js';
+import { manhattanDistance, segmentIntersectsRect } from './geometry.js';
 
 /**
  * Main routing pipeline: grid → route → simplify → format.
@@ -49,19 +49,63 @@ export function routeEdges(
   // Build the grid
   const grid = buildGrid(obstacles, edges, opts.obstacleMargin);
 
-  // Ensure all anchor points exist in the grid
+  // Ensure all anchor points and pinned waypoints exist in the grid (L5 + L6)
   for (const edge of edges) {
-    ensurePointInGrid(grid, edge.sourcePoint);
-    ensurePointInGrid(grid, edge.targetPoint);
+    const exempt = new Set<string>([edge.sourceId, edge.targetId]);
+    ensurePointInGrid(grid, edge.sourcePoint, exempt);
+    ensurePointInGrid(grid, edge.targetPoint, exempt);
+    if (edge.pinnedWaypoints) {
+      for (const wp of edge.pinnedWaypoints) {
+        ensurePointInGrid(grid, wp, exempt);
+      }
+    }
   }
 
   // Route each edge with A*
   const routedSegments = new RoutedSegments();
   const rawPaths = new Map<string, Point[]>();
 
-  // Add pinned edge segments to crossing detection
+  // Route pinned edges: preserve exact waypoints, routing around obstacles on any blocked leg (L5)
   for (const edge of pinnedEdges) {
-    const path = [edge.sourcePoint, ...edge.pinnedWaypoints!, edge.targetPoint];
+    const checkpoints = [edge.sourcePoint, ...edge.pinnedWaypoints!, edge.targetPoint];
+    const thirdPartyObstacles = obstacles.filter((o) => o.id !== edge.sourceId && o.id !== edge.targetId);
+    const hasBlockedLeg = checkpoints.some((pt, idx) => idx < checkpoints.length - 1
+      && thirdPartyObstacles.some((obs) => segmentIntersectsRect({ p1: pt, p2: checkpoints[idx + 1] }, obs)));
+
+    let path: Point[];
+    if (!hasBlockedLeg) {
+      path = checkpoints;
+    } else {
+      path = [checkpoints[0]];
+      for (let i = 0; i < checkpoints.length - 1; i++) {
+        const legStart = checkpoints[i];
+        const legEnd = checkpoints[i + 1];
+        const blocked = thirdPartyObstacles.some((obs) => segmentIntersectsRect({ p1: legStart, p2: legEnd }, obs));
+        if (!blocked) {
+          path.push(legEnd);
+        } else {
+          const routedLeg = findPath(
+            grid,
+            legStart,
+            legEnd,
+            {
+              bendPenalty: opts.bendPenalty,
+              crossingPenalty: opts.crossingPenalty,
+              lengthPenalty: opts.lengthPenalty,
+              sharedSegmentPenalty: opts.sharedSegmentPenalty,
+              sourceDirection: i === 0 ? edge.sourceDirection : undefined,
+              targetDirection: i === checkpoints.length - 2 ? edge.targetDirection : undefined,
+            },
+            routedSegments,
+          );
+          if (routedLeg && routedLeg.length >= 2) {
+            path.push(...routedLeg.slice(1));
+          } else {
+            path.push(legEnd);
+          }
+        }
+      }
+    }
     rawPaths.set(edge.id, path);
     routedSegments.addPath(path);
   }
@@ -76,6 +120,7 @@ export function routeEdges(
         bendPenalty: opts.bendPenalty,
         crossingPenalty: opts.crossingPenalty,
         lengthPenalty: opts.lengthPenalty,
+        sharedSegmentPenalty: opts.sharedSegmentPenalty,
         sourceDirection: edge.sourceDirection,
         targetDirection: edge.targetDirection,
       },
@@ -110,9 +155,10 @@ export function routeEdges(
 
   const simplifiedNonPinned = simplifyPaths(
     nonPinnedPaths,
-    grid.expandedObstacles,
+    obstacles,
     opts.edgeSpacing,
     opts.obstacleMargin,
+    { preserveEndpoints: opts.preserveEndpoints, obstacles },
   );
 
   // Merge back

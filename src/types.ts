@@ -33,6 +33,10 @@ export interface RouterOptions {
   bendPenalty?: number;
   crossingPenalty?: number;
   lengthPenalty?: number;
+  /** Penalty applied when a candidate segment overlaps an already-routed collinear segment. Default: 500. */
+  sharedSegmentPenalty?: number;
+  /** Keep sourcePoint and targetPoint strictly anchored during parallel segment spacing. Default: true. */
+  preserveEndpoints?: boolean;
 }
 
 export interface RouterInput {
@@ -74,4 +78,6 @@ export const DEFAULT_OPTIONS: Required<RouterOptions> = {
   bendPenalty: 50,
   crossingPenalty: 200,
   lengthPenalty: 1,
+  sharedSegmentPenalty: 500,
+  preserveEndpoints: true,
 };
